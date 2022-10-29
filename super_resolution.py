@@ -13,23 +13,6 @@ superresolution_checkpoint_table = {
     "RealESRGAN_x4plus": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
 }
 
-class ReplaceGrad(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x_forward, x_backward):
-        ctx.shape = x_backward.shape
-        return x_forward
-
-    @staticmethod
-    def backward(ctx, grad_in):
-        return None, grad_in.sum_to_size(ctx.shape)
-
-replace_grad = ReplaceGrad.apply
-
-def vector_quantize(x, codebook):
-    d = x.pow(2).sum(dim=-1, keepdim=True) + codebook.pow(2).sum(dim=1) - 2 * x @ codebook.T
-    indices = d.argmin(-1)
-    x_q = F.one_hot(indices, codebook.shape[0]).to(d.dtype) @ codebook
-    return replace_grad(x_q, x)
 
 class ClampWithGrad(torch.autograd.Function):
     @staticmethod

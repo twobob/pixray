@@ -30,11 +30,11 @@ torch.backends.cudnn.benchmark = False		# NR: True is a bit faster, but can lead
 
 from torch_optimizer import DiffGrad, AdamP
 from perlin_numpy import generate_fractal_noise_2d
-from util import str2bool, get_file_path, emit_filename
+from util import str2bool, get_file_path, emit_filename, split_pipes, parse_unit
 
 from slip import get_clip_perceptor
 
-from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
+from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize, InterpolationMode
 
 # installed by doing `pip install git+https://github.com/openai/CLIP`
 from clip import clip
@@ -66,7 +66,7 @@ global_padding_mode = 'reflection'
 global_aspect_width = 1
 global_spot_file = None
 
-from util import map_number, palette_from_string, real_glob
+from util import palette_from_string, real_glob
 
 from vqgan import VqganDrawer
 from vdiff import VdiffDrawer
@@ -75,6 +75,13 @@ class_table = {
     "vqgan": VqganDrawer,
     "vdiff": VdiffDrawer,
 }
+
+try:
+    from fast_pixeldrawer import FastPixelDrawer
+    class_table.update({"fast_pixel": FastPixelDrawer})
+except ImportError as e:
+    print("--> FastPixelDrawer not supported", e)
+    pass
 
 try:
     from super_resolution import SuperResolutionDrawer
@@ -600,7 +607,7 @@ def do_init(args):
 
     # set device only once
     if device is None:
-        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        device = torch.device(args.cuda_device if torch.cuda.is_available() else 'cpu')
 
     drawer = class_table[args.drawer](args)
     drawer.load_model(args, device)
@@ -770,7 +777,7 @@ def do_init(args):
                 input_resolution = perceptor.input_resolution
                 # print(f"Running {clip_model} at {input_resolution}")
                 preprocess = Compose([
-                    Resize(input_resolution, interpolation=Image.BICUBIC),
+                    Resize(input_resolution, interpolation=InterpolationMode.BICUBIC),
                     CenterCrop(input_resolution),
                     ToTensor()
                 ])
@@ -795,7 +802,7 @@ def do_init(args):
                 input_resolution = perceptor.input_resolution
                 # print(f"Running {clip_model} at {input_resolution}")
                 preprocess = Compose([
-                    Resize(input_resolution, interpolation=Image.BICUBIC),
+                    Resize(input_resolution, interpolation=InterpolationMode.BICUBIC),
                     CenterCrop(input_resolution),
                     ToTensor()
                 ])
@@ -869,7 +876,7 @@ def do_init(args):
                 allweights.append(weight)
             pMs.append(Prompt(embed, weight, stop).to(device))
 
-    if drawer_clip_target is not None:
+    if drawer_clip_target is not None and len(allpromptembeds) > 0:
         if args.drawer=="vdiff" and args.vdiff_model[:7] == "cc12m_1":
             target_embeds = torch.cat(allpromptembeds)
             allweights = torch.tensor(allweights, dtype=torch.float, device=device)
@@ -1102,8 +1109,8 @@ def checkdrop(args, iter, losses):
     return drop_loss_time
 
 # for a release just bake in the version to prevent git subprocess lookup
-git_official_release_version = "v1.8.1"
-git_fallback_version = "v1.8.1+"
+git_official_release_version = None
+git_fallback_version = "v1.9.1+"
 
 # https://stackoverflow.com/a/40170206/1010653
 # Return the git revision as a string
@@ -1165,19 +1172,21 @@ def checkin(args, iter, losses):
         writestr = f'anim: {cur_anim_index}/{len(anim_output_files)} {writestr}'
     else:
         writestr = f'{writestr} (-{num_cycles_not_best}=>{best_loss:2.4g})'
-    timg = drawer.synth(cur_iteration)
-    if filters is not None and len(filters)>0:
-        for f in filters:
-            filtclass = f["filter"]
-            timg, closs = filtclass(timg);
 
+    timg, img_alpha = do_synth_and_filter(args, cur_iteration, [], to_file=True)
     img = TF.to_pil_image(timg[0].cpu())
+    # print(f"Gonna save {timg.shape} and {img}")
     # img = drawer.to_image()
     if cur_anim_index is None:
         outfile = get_file_path(args.outdir, args.output, '.png')
     else:
         outfile = anim_output_files[cur_anim_index]
     img.save(outfile, pnginfo=getPngInfo())
+    if args.save_intermediates:
+        step_path = os.path.join(args.outdir, "steps")
+        if not os.path.isdir(step_path):
+            os.makedirs(step_path)
+        imageio.imwrite(get_file_path(step_path, f'frame_{cur_iteration:04d}', '.png'), np.array(img))
     if cur_anim_index == len(anim_output_files) - 1:
         # save gif
         gif_output = make_gif(args, iter)
@@ -1191,19 +1200,14 @@ def checkin(args, iter, losses):
             display.display(display.Image(outfile))
     tqdm.write(writestr)
 
-def ascend_txt(args):
-    global cur_iteration, cur_anim_index, perceptors, cutoutsTable, cutoutSizeTable # normalize, 
-    global z_orig, im_targets, z_labels, init_image_tensor, target_image_tensor, drawer
-    global pmsTable, pmsImageTable, spotPmsTable, spotOffPmsTable, global_padding_mode, global_fill_color
-    global pmsTargetTable
-    global lossGlobals
+def do_synth_and_filter(args, cur_iteration, loss_list, to_file=False):
+    global device, global_fill_color
 
-    if args.transparency:
-        out, alpha = drawer.synth(cur_iteration, return_transparency=True)
-    else:
-        out = drawer.synth(cur_iteration)
-
-    result = []
+    out = drawer.synth(cur_iteration)
+    # if args.transparency:
+    #     out, alpha = drawer.synth(cur_iteration, return_transparency=True)
+    # else:
+    #     out = drawer.synth(cur_iteration)
 
     if filters is not None and len(filters)>0:
         for f in filters:
@@ -1211,11 +1215,37 @@ def ascend_txt(args):
             filtweight = f["weight"]
             out, new_losses = filtclass(out);
             if type(new_losses) is not list and type(new_losses) is not tuple:
-                result.append(filtweight * new_losses)
+                loss_list.append(filtweight * new_losses)
             else:
                 # warning: this path might be untested by current losses?
                 weighted_losses = [(filtweight * l) for l in new_losses]
-                result += weighted_losses
+                loss_list += weighted_losses
+
+
+    alpha = None
+    # flatten to 3 channel
+    _B,C,_H,_W = out.shape
+    if C == 4:
+        colors = out[:,0:3,:,:]
+        if args.transparent:
+            if not to_file:
+                # random squash
+                # print(f"Flattening {out.shape} on {global_fill_color[0]}")
+                alpha = out[:,3,:,:]
+                bg_shade = global_fill_color[0] * torch.ones(size=(_B,3,_H,_W), device=device, dtype=torch.float)
+                out = alpha * colors + (1 - alpha) * bg_shade
+                TF.to_pil_image(out[0].cpu()).save("flat.png")
+        else:
+            out = colors
+
+    return out, alpha
+
+def ascend_txt(args):
+    global cur_iteration, cur_anim_index, perceptors, cutoutsTable, cutoutSizeTable # normalize, 
+    global z_orig, im_targets, z_labels, init_image_tensor, target_image_tensor, drawer
+    global pmsTable, pmsImageTable, spotPmsTable, spotOffPmsTable, global_padding_mode, global_fill_color
+    global pmsTargetTable
+    global lossGlobals
 
     if (cur_iteration%2 == 0):
         global_padding_mode = 'reflection'
@@ -1226,6 +1256,9 @@ def ascend_txt(args):
     # print("Color fill is ", color_fill)
     # color_fill = 1.0
     global_fill_color =torch.tensor([color_fill,color_fill,color_fill], device=device, dtype=torch.float)
+
+    result = []
+    out, img_alpha = do_synth_and_filter(args, cur_iteration, result)
 
     cur_cutouts = {}
     cur_spot_cutouts = {}
@@ -1347,8 +1380,10 @@ def ascend_txt(args):
         "embeds": iii,
     }
 
-    if args.transparency:
-        result.append(args.alpha_weight*torch.mean(alpha))
+    if img_alpha is not None and args.transparent_weight != 0:
+        t_loss = args.transparent_weight*torch.mean(img_alpha)
+        # print(f"with weight {args.transparent_weight} the loss is {t_loss}")
+        result.append(t_loss)
     
     if args.custom_loss is not None and len(args.custom_loss)>0:
         for t in args.custom_loss:
@@ -1362,10 +1397,11 @@ def ascend_txt(args):
                 weighted_losses = [(lossweight * l) for l in new_losses]
                 result += weighted_losses
 
-    if args.make_video:    
+    if args.make_video:
+        video_folder = os.path.join(args.outdir, "video")
         img = np.array(out.mul(255).clamp(0, 255)[0].cpu().detach().numpy().astype(np.uint8))[:,:,:]
         img = np.transpose(img, (1, 2, 0))
-        imageio.imwrite(f'./steps/frame_{cur_iteration:04d}.png', np.array(img))
+        imageio.imwrite(f'{video_folder}/frame_{cur_iteration:04d}.png', np.array(img))
 
     return result
 
@@ -1596,10 +1632,47 @@ def do_run(args, return_display=False):
     if args.make_video:
         do_video(args)
 
+    if args.save_intermediates:
+        step_to_video(args)
+
     return True
+
+def step_to_video(args):
+    step_folder = os.path.join(args.outdir, "steps")
+    output_file = os.path.join(step_folder, "output.mp4")
+    les_frame_path = sorted(glob.glob(os.path.join(step_folder, "frame_*.png")))
+
+    les_frame = []
+    for frame_path in les_frame_path:
+        les_frame.append(Image.open(frame_path))
+    
+    min_fps = 10
+    max_fps = 60
+    total_frames = len(les_frame)
+    length = 14
+    fps = int(np.clip(total_frames/length,min_fps,max_fps))
+    from subprocess import Popen, PIPE
+    p = Popen(['ffmpeg',
+               '-y',
+               '-f', 'image2pipe',
+               '-vcodec', 'png',
+               '-r', str(fps),
+               '-i',
+               '-',
+               '-vcodec', 'libx264',
+               '-r', str(fps),
+               '-pix_fmt', 'yuv420p',
+               '-crf', '17',
+               '-preset', 'veryslow',
+               output_file], stdin=PIPE)
+    for im in tqdm(les_frame + [les_frame[-1]]*fps):
+        im.save(p.stdin, 'PNG')
+    p.stdin.close()
+    p.wait()
 
 def do_video(args):
     global cur_iteration
+    video_folder = os.path.join(args.outdir, "video")
 
     # Video generation
     init_frame = 1 # This is the frame where the video will start
@@ -1610,15 +1683,15 @@ def do_video(args):
 
     total_frames = last_frame-init_frame
 
-    length = 15 # Desired time of the video in seconds
+    length = 14 # Desired time of the video in seconds
 
     frames = []
     tqdm.write('Generating video...')
     for i in range(init_frame,last_frame): #
-        frames.append(Image.open(f'./steps/frame_{i:04d}.png'))
+        frames.append(Image.open(f'{video_folder}/frame_{i:04d}.png'))
 
     #fps = last_frame/10
-    fps = np.clip(total_frames/length,min_fps,max_fps)
+    fps = int(np.clip(total_frames/length,min_fps,max_fps))
 
     from subprocess import Popen, PIPE
     output_file = get_file_path(args.outdir, args.output, '.mp4')
@@ -1636,7 +1709,7 @@ def do_video(args):
                '-preset', 'veryslow',
                '-metadata', f'comment={args.prompts}',
                output_file], stdin=PIPE)
-    for im in tqdm(frames):
+    for im in tqdm(frames + [frames[-1]] * fps):
         im.save(p.stdin, 'PNG')
     p.stdin.close()
     p.wait()
@@ -1663,12 +1736,13 @@ def setup_parser(vq_parser):
     vq_parser.add_argument("-il",   "--image_labels", type=str, help="Image prompts", default=None, dest='image_labels')
     vq_parser.add_argument("-ilw",  "--image_label_weight", type=float, help="Weight for image prompt", default=1.0, dest='image_label_weight')
     vq_parser.add_argument("-i",    "--iterations", type=int, help="Number of iterations", default=None, dest='iterations')
-    vq_parser.add_argument("-se",   "--save_every", type=int, help="Save image iterations", default=10, dest='save_every')
-    vq_parser.add_argument("-de",   "--display_every", type=int, help="Display image iterations", default=20, dest='display_every')
+    vq_parser.add_argument("-se",   "--save_every", type=str, help="Save image iterations", default=10, dest='save_every')
+    vq_parser.add_argument("-si",   "--save_intermediates", type=str2bool, help="Save image iterations as intermediate files", default=True, dest='save_intermediates')
+    vq_parser.add_argument("-de",   "--display_every", type=str, help="Display image iterations", default=20, dest='display_every')
     vq_parser.add_argument("-dc",   "--display_clear", type=str2bool, help="Clear dispaly when updating", default=False, dest='display_clear')
-    vq_parser.add_argument("-ove",  "--overlay_every", type=int, help="Overlay image iterations", default=10, dest='overlay_every')
-    vq_parser.add_argument("-ovo",  "--overlay_offset", type=int, help="Overlay image iteration offset", default=0, dest='overlay_offset')
-    vq_parser.add_argument("-ovu",  "--overlay_until", type=int, help="Last iteration to continue applying overlay image", default=None, dest='overlay_until')
+    vq_parser.add_argument("-ove",  "--overlay_every", type=str, help="Overlay image iterations", default="10 iterations", dest='overlay_every')
+    vq_parser.add_argument("-ovo",  "--overlay_offset", type=str, help="Overlay image iteration offset", default="0 iterations", dest='overlay_offset')
+    vq_parser.add_argument("-ovu",  "--overlay_until", type=str, help="Last iteration to continue applying overlay image", default=None, dest='overlay_until')
     vq_parser.add_argument("-ovi",  "--overlay_image", type=str, help="Overlay image (if not init)", default=None, dest='overlay_image')
     vq_parser.add_argument(         "--quality", type=str, help="draft, normal, better, best", default="normal", dest='quality')
     vq_parser.add_argument("-asp",  "--aspect", type=str, help="widescreen, square", default="widescreen", dest='aspect')
@@ -1691,7 +1765,7 @@ def setup_parser(vq_parser):
     vq_parser.add_argument("-nps",  "--noise_prompt_seeds", nargs="*", type=int, help="Noise prompt seeds", default=[], dest='noise_prompt_seeds')
     vq_parser.add_argument("-npw",  "--noise_prompt_weights", nargs="*", type=float, help="Noise prompt weights", default=[], dest='noise_prompt_weights')
     vq_parser.add_argument("-lr",   "--learning_rate", type=float, help="Learning rate", default=0.2, dest='learning_rate')
-    vq_parser.add_argument("-lrd",  "--learning_rate_drops", nargs="*", type=float, help="When to drop learning rate (relative to iterations)", default=[75], dest='learning_rate_drops')
+    vq_parser.add_argument("-lrd",  "--learning_rate_drops", nargs="*", type=str, help="When to drop learning rate (relative to iterations)", default=[75], dest='learning_rate_drops')
     vq_parser.add_argument("-as",   "--auto_stop", type=str2bool, help="Auto stopping", default=False, dest='auto_stop')
     vq_parser.add_argument("-cuts", "--num_cuts", type=int, help="Number of cuts", default=None, dest='num_cuts')
     vq_parser.add_argument("-bats", "--batches", type=int, help="How many batches of cuts", default=None, dest='batches')
@@ -1700,9 +1774,10 @@ def setup_parser(vq_parser):
     vq_parser.add_argument("-opt",  "--optimiser", type=str, help="Optimiser (Adam, AdamW, Adagrad, Adamax, DiffGrad, or AdamP)", default='Adam', dest='optimiser')
     vq_parser.add_argument("-vid",  "--video", type=str2bool, help="Create video frames?", default=False, dest='make_video')
     vq_parser.add_argument("-d",    "--deterministic", type=str2bool, help="Enable cudnn.deterministic?", default=False, dest='cudnn_determinism')
+    vq_parser.add_argument("-cud",  "--cuda_device", type=str, help="The Cuda device you want to use. (Typically 'cuda:0','cuda:1','cuda:2', etc...)", default='cuda:0', dest='cuda_device')
     vq_parser.add_argument("--palette", type=str, help="target palette", default=None, dest='palette')
-    vq_parser.add_argument("--transparent", type=str2bool, help="enable transparency", default=False, dest='transparency')
-    vq_parser.add_argument("--alpha_weight", type=float, help="strenght of alpha loss", default=1., dest='alpha_weight')
+    vq_parser.add_argument("--transparent", type=str2bool, help="enable transparent outputs", default=False, dest='transparent')
+    vq_parser.add_argument("--transparent_weight", type=float, help="strenght of transparent loss", default=0., dest='transparent_weight')
     vq_parser.add_argument("--alpha_use_g", type=str2bool, help="use gaussian mask weighting", default=False, dest='alpha_use_g')
     vq_parser.add_argument("--alpha_gamma", type=float, help="width-relative sigma for the alpha gaussian", default=4., dest='alpha_gamma')
     vq_parser.add_argument("--output", type=str, help="Output filename", default="output.png", dest='output')
@@ -1858,25 +1933,18 @@ def process_args(vq_parser, namespace=None):
     if args.init_noise.lower() == "none":
         args.init_noise = None
 
-    # Split text prompts using the pipe character
-    if args.prompts:
-        args.prompts = [phrase.strip() for phrase in args.prompts.split("|")]
+    args.prompts = split_pipes(args.prompts)
+    args.target_images = split_pipes(args.target_images)
+    args.spot_prompts = split_pipes(args.spot_prompts)
+    args.spot_prompts_off = split_pipes(args.spot_prompts_off)
+    args.labels = split_pipes(args.labels)
 
-    # Split text prompts using the pipe character
-    if args.target_images:
-        args.target_images = [phrase.strip() for phrase in args.target_images.split("|")]
+    args.overlay_offset = parse_unit(args.overlay_offset, args.iterations, "overlay_offset", "i")
+    args.overlay_until = parse_unit(args.overlay_until, args.iterations, "overlay_until", "i")
+    args.overlay_every = parse_unit(args.overlay_every, args.iterations, "overlay_every", "i")
 
-    # Split text prompts using the pipe character
-    if args.spot_prompts:
-        args.spot_prompts = [phrase.strip() for phrase in args.spot_prompts.split("|")]
-
-    # Split text prompts using the pipe character
-    if args.spot_prompts_off:
-        args.spot_prompts_off = [phrase.strip() for phrase in args.spot_prompts_off.split("|")]
-
-    # Split text labels using the pipe character
-    if args.labels:
-        args.labels = [phrase.strip() for phrase in args.labels.split("|")]
+    args.display_every = parse_unit(args.display_every, args.iterations, "display_every", "i")
+    args.save_every = parse_unit(args.save_every, args.iterations, "save_every", "i")
 
     # Split target images using the pipe character
     if args.image_prompts:
@@ -1904,13 +1972,11 @@ def process_args(vq_parser, namespace=None):
 
     # Make video steps directory
     if args.make_video:
-        if not os.path.exists('steps'):
-            os.mkdir('steps')
+        video_folder = os.path.join(args.outdir, "video")
+        if not os.path.exists(video_folder):
+            os.mkdir(video_folder)
 
-    if args.learning_rate_drops is None:
-        args.learning_rate_drops = []
-    else:
-        args.learning_rate_drops = [int(map_number(n, 0, 100, 0, args.iterations-1)) for n in args.learning_rate_drops]
+    args.learning_rate_drops = get_learning_rate_drops(args.learning_rate_drops, args.iterations);
 
     # reset global animation variables
     cur_iteration=0
@@ -1929,6 +1995,12 @@ def process_args(vq_parser, namespace=None):
     global_spot_file = args.spot_file
 
     return args
+
+def get_learning_rate_drops(learning_rate_drops, iterations):
+    if learning_rate_drops is None:
+        return []
+    
+    return [parse_unit(n, iterations-1, "learning_rate_drops") for n in learning_rate_drops]
 
 def reset_settings():
     global global_pixray_settings
